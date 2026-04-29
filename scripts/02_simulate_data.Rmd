@@ -1,0 +1,556 @@
+---
+title: "Simulate many data sets"
+author: "Ada Yan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+To do: rerun the inference with the new simulated data
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, echo = FALSE, fig.width = 8, fig.height = 8)
+```
+
+```{r include = FALSE}
+rm(list = ls())
+git_dir <- "../"
+devtools::load_all(git_dir)
+library(tidyverse)
+library(cmdstanr) # switch to cmdstanr for now as require Stan 2.34 for dirichlet_multinomial which is not available on rstan
+library(bayesplot)
+set.seed(1)
+dir_name <- make_dir_Rmd("simulate_data.Rmd")
+samples_filename <- paste0(dir_name, "samples_immune.rds")
+```
+
+# Aims
+
+- Use LHS sampling to find a range of parameter values to produce reasonable viral load trajectories
+- Also, for the same parameter set, we want to generate different noisy data sets (see. Fig. 5 of https://doi.org/10.1016/j.epidem.2017.01.004 for visualisation of many replicates)
+- To be comparable between data sets, we fix innate and adaptive immune parameters to single values
+
+```{r pars, echo = TRUE}
+pars <- get_default_pars()
+
+pars[["burst_size"]] <- pars[["p"]] / pars[["delta"]]
+
+log10_pars <- log10(pars)
+names(log10_pars) <- paste0("log10_", names(pars))
+
+varied_par_names <- c("log10_beta1", "log10_burst_size", "log10_V_0", "log10_delta", "log10_c1", "alpha")
+
+# 1 order of magnitude each way for everything except $\alpha$
+varied_par_ranges <- matrix(1, ncol = 2, nrow = length(varied_par_names))
+varied_par_ranges[,1] <- -1
+varied_par_ranges <- varied_par_ranges + log10_pars[varied_par_names]
+varied_par_ranges[nrow(varied_par_ranges),] <- c(0, 1)
+rownames(varied_par_ranges) <- varied_par_names
+colnames(varied_par_ranges) <- c("min", "max")
+N_samples <- 5000
+N_samples_target <- 100
+```
+
+```{r eval = FALSE}
+samples <- lhs::randomLHS(N_samples, length(varied_par_names))
+colnames(samples) <- varied_par_names
+
+scale_samples <- function(vec, bounds) {
+  vec * diff(bounds) + bounds[1]
+}
+
+for(i in seq_along(varied_par_names)) {
+  samples[,i] <- scale_samples(samples[,i], varied_par_ranges[i,])
+}
+
+log10_par_idx <- grepl("log10_", varied_par_names)
+varied_par_names <- gsub("log10_", "", varied_par_names)
+
+samples[,log10_par_idx] <- 10^samples[,log10_par_idx]
+colnames(samples) <- varied_par_names
+
+calc_r_wrapper <- function(beta1, T_0, p, delta, c1) {
+  pars <- list(beta1 = beta1, T_0 = T_0, p = p, delta = delta, c1 = c1)
+  calc_r(pars)
+}
+calc_r_wrapper <- Vectorize(calc_r_wrapper)
+
+samples <- samples %>%
+  as_tibble() %>%
+  mutate(p = delta * burst_size,
+         T_0 = 7e7,
+         R_0 = beta1 * T_0 * p / delta / (c1 + pars[["k1"]] * pars[["A_0"]]), # for the homogeneous model
+         r = calc_r_wrapper(beta1, T_0, p, delta, c1 + pars[["k1"]] * pars[["A_0"]])) %>% # for the homogeneous model
+  select(-burst_size) %>%
+  filter(R_0 > 1, r < log(1e5), r > log(1e3)) %>%
+  slice_head(n = N_samples_target) %>%
+  mutate(idx = seq_len(n()))
+
+if(file.exists(samples_filename)) warning("overwriting existing parameter values")
+saveRDS(samples, samples_filename)
+```
+
+# Simulations from model
+
+```{r}
+samples <- readRDS(samples_filename)
+solving_time <- get_solving_time()
+
+model_filename <- "innate_adaptive.R"
+# compile ODEs
+gen <- compile_model(model_filename)
+
+varied_par_names <- gsub("log10_", "", varied_par_names)
+fixed_par_names <- names(pars)[!(names(pars) %in% varied_par_names)]
+fixed_par_names <- fixed_par_names[!fixed_par_names == "p"]
+
+solve_model <- function(idx) {
+  samples %>%
+    filter(idx == !!idx) %>%
+    select(-c(T_0, R_0, r, idx, alpha)) %>%
+    as.list() %>%
+    c(as.list(pars[fixed_par_names])) %>%
+    simple_solve(gen = gen, solving_time = solving_time) %>%
+    mutate(idx = !!idx)
+} 
+```
+
+```{r}
+sol <- lapply(seq_len(N_samples_target), solve_model) %>%
+  bind_rows()
+
+plot_sol <- function(start_idx) {
+  sol %>%
+    filter(idx >= start_idx, idx < start_idx + 20) %>%
+    ggplot(aes(x = t, y = V)) +
+    facet_wrap(~idx) +
+    geom_line() +
+    scale_y_log10("Viral load (pfu/mL)", limits = c(1, 1e10)) +
+    theme_bw() +
+    xlab("Time (days)")
+}
+```
+
+```{r eval = FALSE, sol1, fig.cap = "Solutions to simulations 1-20."}
+plot_sol(1)
+```
+
+```{r eval = FALSE, sol2, fig.cap = "Solutions to simulations 21-40."}
+plot_sol(21)
+```
+
+```{r eval = FALSE, sol3, fig.cap = "Solutions to simulations 41-60."}
+plot_sol(41)
+```
+
+```{r eval = FALSE, sol4, fig.cap = "Solutions to simulations 61-80."}
+plot_sol(61)
+```
+
+```{r eval = FALSE, sol5, fig.cap = "Solutions to simulations 81-100."}
+plot_sol(81)
+```
+
+# With heterogeneity
+
+Note that in the WIMSIG simulations, I was varying $\beta_i$ and $\alpha = T_{01} / T_0$ independently, whereas now I am trying to keep $\bar{\beta} T_0 = \sum_{i=1}^N \beta_i T_{0i}$ constant.
+
+First attempt at definition:
+
+We define $\beta_1 = \bar{\beta} (1 - \Delta T_0/T_{01})$, $\beta_2 = \bar{\beta} (1 + \Delta T_0/T_{02})$ such that $\beta_1 T_{01} + \beta_2 T_{02} = (\bar{\beta} - \Delta \bar{\beta} T_{0}/T_{01}) T_{01} + (\bar{\beta} + \Delta \bar{\beta} T_{0}/T_{02}) T_{02} = \bar{\beta} T_0$ is constant regardless of the value of $\Delta$.
+
+The range of $\Delta$ such that $\beta_1 > 0, \beta_2 > 0$ is $-T_{02}/T_0 < \Delta < T_{01}/T_0$.  We define a scaled version of $\Delta$, $\Delta'$, where $-1 \leq \Delta' \leq 1$. The scaling is defined by $\Delta = \Delta' T_{02}/T_0$ for $\Delta' < 0$ and $\Delta = \Delta' T_{01}/T_0$ for $\Delta' > 0$.  This leads to the desired ranges $-T_{02}/T_0 < \Delta < T_{01}/T_0$.  If we substitute the definition of $\Delta'$ into the definitions of $\beta_1$ and $\beta_2$, we get $\beta_1 = \bar{\beta} (1 - \Delta' T_{02}/T_{01})$, $\beta_2 = \bar{\beta} (1 + \Delta')$ for $\Delta' < 0$, $\beta_1 = \bar{\beta} (1 - \Delta'T_{01}/T_{02})$, $\beta_2 = \bar{\beta} (1 + \Delta')$ for $\Delta' > 0$.
+
+In summary:
+
+We define $\beta_1 = \bar{\beta} (1 - \Delta' T_{02}/T_{01})$, $\beta_2 = \bar{\beta} (1 + \Delta')$ for $\Delta' < 0$, $\beta_1 = \bar{\beta} (1 - \Delta')$, $\beta_2 = \bar{\beta} (1 + \Delta' T_{01}/T_{02})$ for $\Delta' > 0$, $-1 \leq \Delta' \leq 1$.
+
+Note that $\Delta'$ is not directly the standard deviation for $\beta_i T_{0i}$, as $\beta_1 T_{01} = \bar{\beta} T_{01} - \bar{\beta} \Delta T_{0}$ and $\beta_2 T_{02} = \bar{\beta} T_{02} + \bar{\beta} \Delta T_{0}$. The standard deviation is actually $\bar{\beta} \frac{T_{02} - T_{01}}{2} + \bar{\beta} \Delta T_0$.
+
+```{r}
+Delta_scaled <- seq(-.8, .8, by = .2)
+
+two_beta_filename <- "innate_adaptive_two_beta.R"
+# compile ODEs
+gen <- compile_model(two_beta_filename)
+
+solve_two_beta <- function(idx, Delta_scaled) { # calculate beta1 T_01 + beta2 T_02 = beta T_0
+  sample_pars <- samples %>%
+    filter(idx == !!idx) %>%
+    select(-c(T_0, R_0, r, idx)) %>%
+    as.list()
+  if(Delta_scaled < 0) {
+    Delta <- Delta_scaled * (1 - sample_pars$alpha)
+  } else {
+    Delta <- Delta_scaled * sample_pars$alpha
+  }
+  beta1 <- sample_pars$beta1
+  sample_pars$beta1[1] <-  beta1 * (1 - Delta / sample_pars$alpha)
+  sample_pars$beta1[2] <-  beta1 * (1 + Delta / (1 - sample_pars$alpha))
+  stopifnot(all(sample_pars$beta1 > 0))
+  sample_pars <- c(sample_pars, as.list(pars[fixed_par_names]))
+  simple_solve(gen = gen, pars = sample_pars, solving_time = solving_time) %>%
+    mutate(idx = !!idx,
+           Delta_scaled = !!Delta_scaled)
+} 
+```
+
+```{r}
+par_grid <- expand_grid(idx = seq_len(N_samples_target), Delta_scaled = Delta_scaled)
+sol <- par_grid %>%
+  apply_named_args(1, solve_two_beta) %>%
+  bind_rows()
+
+plot_subset <- c(-.8, 0, .8)
+
+plot_sol <- function(start_idx, n_sims = 20) {
+  g <- sol %>%
+    filter(idx >= start_idx, idx < start_idx + n_sims, Delta_scaled %in% plot_subset) %>%
+    ggplot(aes(x = t, y = V, color = Delta_scaled, group = Delta_scaled)) +
+    geom_line() +
+    scale_y_log10("Viral load (pfu/mL)", limits = c(1, 1e10)) +
+    scale_colour_gradient2(low = "red",  mid = "black",  high = "blue") +
+    theme_bw() +
+    xlab("Time (days)") +
+    labs(colour = latex2exp::TeX("$\\Delta$"))
+  if(n_sims <= 5) {
+    g <- g + facet_wrap(~idx, nrow = 1)
+  } else {
+    g <- g + facet_wrap(~idx)
+  }
+  g
+}
+```
+
+```{r sol1-het, fig.cap = "Solutions to simulations 1-20."}
+plot_sol(1)
+```
+
+```{r sol2-het, fig.cap = "Solutions to simulations 21-40."}
+plot_sol(21)
+```
+
+```{r sol2-het-25, fig.cap = "Solutions to simulations 21-25.", fig.width = 8, fig.height = 2}
+plot_sol(21, 5)
+```
+
+```{r sol3-het, fig.cap = "Solutions to simulations 41-60."}
+plot_sol(41)
+```
+
+```{r sol4-het, fig.cap = "Solutions to simulations 61-80."}
+plot_sol(61)
+```
+
+```{r sol5-het, fig.cap = "Solutions to simulations 81-100."}
+plot_sol(81)
+```
+
+```{r}
+plot_sol_cell <- function(start_idx) {
+  sol %>%
+    filter(idx >= start_idx, idx < start_idx + 5, Delta_scaled %in% plot_subset) %>%
+    select(-V) %>%
+    mutate(across(ends_with("]"), ~ .x / (`T1[1]` + `T1[2]` + `I1[1]` + `I1[2]`))) %>%
+    pivot_longer(ends_with("]"), names_to = "compartment_name", values_to = "prop_value") %>%
+    ggplot(aes(x = t, y = prop_value, colour = Delta_scaled, group = Delta_scaled)) +
+    facet_grid(idx~compartment_name) +
+    geom_line() +
+    theme_bw() +
+    xlab("Time (days)") +
+    scale_y_log10("Proportion of cells") +
+    scale_colour_gradient2(low = "red",  mid = "black",  high = "blue") +
+    coord_cartesian(xlim = c(0, 2), ylim = c(1e-5, 1)) +
+    labs(colour = latex2exp::TeX("$\\Delta$"))
+}
+```
+
+```{r eval = FALSE, cell1, fig.cap = "Cell proportion data for simulations 1-5."}
+plot_sol_cell(1)
+```
+
+```{r eval = FALSE, cell2, fig.cap = "Cell proportion data for simulations 6-10."}
+plot_sol_cell(6)
+```
+
+```{r eval = FALSE, cell3, fig.cap = "Cell proportion data for simulations 11-15."}
+plot_sol_cell(11)
+```
+
+```{r eval = FALSE, cell4, fig.cap = "Cell proportion data for simulations 16-20."}
+plot_sol_cell(16)
+```
+
+```{r eval = FALSE, cell5, fig.cap = "Cell proportion data for simulations 21-25."}
+plot_sol_cell(21)
+```
+
+```{r eval = FALSE, cell6, fig.cap = "Cell proportion data for simulations 26-30."}
+plot_sol_cell(26)
+```
+
+```{r eval = FALSE, cell7, fig.cap = "Cell proportion data for simulations 31-35."}
+plot_sol_cell(31)
+```
+
+```{r eval = FALSE, cell8, fig.cap = "Cell proportion data for simulations 36-40."}
+plot_sol_cell(36)
+```
+
+```{r eval = FALSE, cell9, fig.cap = "Cell proportion data for simulations 41-45."}
+plot_sol_cell(41)
+```
+
+```{r eval = FALSE, cell10, fig.cap = "Cell proportion data for simulations 46-50."}
+plot_sol_cell(46)
+```
+
+```{r eval = FALSE, cell11, fig.cap = "Cell proportion data for simulations 51-55."}
+plot_sol_cell(51)
+```
+
+```{r eval = FALSE, cell12, fig.cap = "Cell proportion data for simulations 56-60."}
+plot_sol_cell(56)
+```
+
+```{r eval = FALSE, cell13, fig.cap = "Cell proportion data for simulations 61-65."}
+plot_sol_cell(61)
+```
+
+```{r eval = FALSE, cell14, fig.cap = "Cell proportion data for simulations 66-70."}
+plot_sol_cell(66)
+```
+
+```{r eval = FALSE, cell15, fig.cap = "Cell proportion data for simulations 71-75."}
+plot_sol_cell(71)
+```
+
+```{r eval = FALSE, cell16, fig.cap = "Cell proportion data for simulations 76-80."}
+plot_sol_cell(76)
+```
+
+```{r eval = FALSE, cell17, fig.cap = "Cell proportion data for simulations 81-85."}
+plot_sol_cell(81)
+```
+
+```{r eval = FALSE, cell18, fig.cap = "Cell proportion data for simulations 86-90."}
+plot_sol_cell(86)
+```
+
+```{r eval = FALSE, cell19, fig.cap = "Cell proportion data for simulations 91-95."}
+plot_sol_cell(91)
+```
+
+```{r eval = FALSE, cell20, fig.cap = "Cell proportion data for simulations 96-100."}
+plot_sol_cell(96)
+```
+
+Put noise on the simulated data:
+
+```{r}
+sampling_times <- get_sampling_times()
+sampling_pars <- get_sampling_pars()
+```
+
+```{r}
+simulate_data_partial <- function(idx, Delta_scaled, eval) {
+  sim_filename <- paste0(dir_name, "sim_data_immune_", idx, "_",
+                         make_filename_from_number(Delta_scaled), ".rds")
+  if(!eval) return(sim_filename)
+  sol %>%
+    filter(idx == !!idx, Delta_scaled == !!Delta_scaled) %>%
+    simulate_data(sampling_times, sampling_pars, cells = TRUE, sim_filename)
+}
+```
+
+```{r eval = FALSE}
+par_grid %>%
+  mutate(eval = TRUE) %>%
+  apply_named_args(1, simulate_data_partial)
+```
+
+```{r}
+get_sim_data <- function(idx, Delta_scaled) {
+  sim_data <- simulate_data_partial(idx, Delta_scaled, eval = FALSE) %>% 
+    readRDS()
+  sim_data$obs_V <- sim_data$obs_V %>%
+    mutate(idx = !!idx, Delta_scaled = !!Delta_scaled)
+  sim_data$obs_C <- sim_data$obs_C %>%
+    mutate(idx = !!idx, Delta_scaled = !!Delta_scaled)
+  sim_data
+}
+
+sim_data <- apply_named_args(par_grid, 1, get_sim_data)
+sim_data_V <- lapply(sim_data, \(x) x$obs_V) %>%
+  bind_rows()
+sim_data_C <- lapply(sim_data, \(x) x$obs_C) %>%
+  bind_rows()
+rm(sim_data)
+
+plot_sol_V_noise <- function(sol, sim_data_V, start_idx) {
+  sol <- sol %>%
+    filter(idx >= start_idx, idx < start_idx + 20, Delta_scaled %in% plot_subset)
+  sim_data_V <- sim_data_V %>%
+    filter(idx >= start_idx, idx < start_idx + 20, Delta_scaled %in% plot_subset)
+  ggplot(sol, aes(x = t, color = Delta_scaled, group = Delta_scaled)) +
+    facet_wrap(~idx) +
+    geom_line(aes(y = V)) +
+    geom_point(data = sim_data_V, aes(y = obs_V)) +
+    scale_y_log10("Viral load (pfu/mL)", limits = c(1, 1e10)) +
+    scale_colour_gradient2(low = "red",  mid = "black",  high = "blue") +
+    theme_bw() +
+    xlab("Time (days)") +
+    labs(colour = latex2exp::TeX("$\\Delta$"))
+}
+```
+
+
+```{r fig.width = 4, fig.height = 3, eval = FALSE}
+plot_sol_V_noise(sol, sim_data_V, 100) 
+```
+
+```{r sol-V-noise1, fig.cap = "Solutions to viral load simulations 1-20 with noise."}
+plot_sol_V_noise(sol, sim_data_V, 1) 
+```
+
+```{r sol-V-noise2, fig.cap = "Solutions to viral load simulations 21-40 with noise."}
+plot_sol_V_noise(sol, sim_data_V, 21) 
+```
+
+```{r sol-V-noise3, fig.cap = "Solutions to viral load simulations 41-60 with noise."}
+plot_sol_V_noise(sol, sim_data_V, 41) 
+```
+
+```{r sol-V-noise4, fig.cap = "Solutions to viral load simulations 61-80 with noise."}
+plot_sol_V_noise(sol, sim_data_V, 61) 
+```
+
+```{r sol-V-noise5, fig.cap = "Solutions to viral load simulations 81-100 with noise."}
+plot_sol_V_noise(sol, sim_data_V, 81) 
+```
+
+```{r}
+plot_sol_cell <- function(start_idx) {
+  
+  sim_data_C <- sim_data_C %>%
+    rename(`U1[1]` = `T1[1]`,
+           `U1[2]` = `T1[2]`)
+  keep_cols <- colnames(sim_data_C)
+  
+  process <- function(sol) {
+    sol <- sol %>%
+      filter(idx >= start_idx, idx < start_idx + 5, Delta_scaled %in% plot_subset)#
+    if("R[1]" %in% colnames(sol)) {
+      sol <- sol %>%
+        mutate(`U1[1]` = `T1[1]` + `R[1]`,
+               `U1[2]` = `T1[2]` + `R[2]`)
+      
+    }
+    
+    sol %>%
+      select(all_of(keep_cols)) %>%
+      mutate(across(ends_with("]"), ~ .x / (`U1[1]` + `U1[2]` + `I1[1]` + `I1[2]`))) %>%
+      pivot_longer(ends_with("]"), names_to = "compartment_name", values_to = "prop_value") %>%
+      filter(Delta_scaled %in% plot_subset)
+  }
+  
+  sol <- sol %>% process()
+  sim_data_C <- sim_data_C %>% process()
+  
+  ggplot(sol, aes(x = t, y = prop_value, colour = Delta_scaled, group = Delta_scaled)) +
+    facet_grid(idx~compartment_name) +
+    geom_line() +
+    geom_point(data = sim_data_C) +
+    theme_bw() +
+    xlab("Time (days)") +
+    scale_y_log10("Proportion of cells") +
+    scale_colour_gradient2(low = "red",  mid = "black",  high = "blue") +
+    coord_cartesian(xlim = c(0, 2), ylim = c(1e-5, 1)) +
+    labs(colour = latex2exp::TeX("$\\Delta$"))
+}
+```
+
+```{r cell-noise1, fig.cap = "Cell proportion data for simulations 1-5."}
+plot_sol_cell(1)
+```
+
+```{r cell-noise2, fig.cap = "Cell proportion data for simulations 6-10."}
+plot_sol_cell(6)
+```
+
+```{r cell-noise3, fig.cap = "Cell proportion data for simulations 11-15."}
+plot_sol_cell(11)
+```
+
+```{r cell-noise4, fig.cap = "Cell proportion data for simulations 16-20."}
+plot_sol_cell(16)
+```
+
+```{r cell-noise5, fig.cap = "Cell proportion data for simulations 21-25."}
+plot_sol_cell(21)
+```
+
+```{r cell-noise6, fig.cap = "Cell proportion data for simulations 26-30."}
+plot_sol_cell(26)
+```
+
+```{r cell-noise7, fig.cap = "Cell proportion data for simulations 31-35."}
+plot_sol_cell(31)
+```
+
+```{r cell-noise8, fig.cap = "Cell proportion data for simulations 36-40."}
+plot_sol_cell(36)
+```
+
+```{r cell-noise9, fig.cap = "Cell proportion data for simulations 41-45."}
+plot_sol_cell(41)
+```
+
+```{r cell-noise10, fig.cap = "Cell proportion data for simulations 46-50."}
+plot_sol_cell(46)
+```
+
+```{r cell-noise11, fig.cap = "Cell proportion data for simulations 51-55."}
+plot_sol_cell(51)
+```
+
+```{r cell-noise12, fig.cap = "Cell proportion data for simulations 56-60."}
+plot_sol_cell(56)
+```
+
+```{r cell-noise13, fig.cap = "Cell proportion data for simulations 61-65."}
+plot_sol_cell(61)
+```
+
+```{r cell-noise14, fig.cap = "Cell proportion data for simulations 66-70."}
+plot_sol_cell(66)
+```
+
+```{r cell-noise15, fig.cap = "Cell proportion data for simulations 71-75."}
+plot_sol_cell(71)
+```
+
+```{r cell-noise16, fig.cap = "Cell proportion data for simulations 76-80."}
+plot_sol_cell(76)
+```
+
+```{r cell-noise17, fig.cap = "Cell proportion data for simulations 81-85."}
+plot_sol_cell(81)
+```
+
+```{r cell-noise18, fig.cap = "Cell proportion data for simulations 86-90."}
+plot_sol_cell(86)
+```
+
+```{r cell-noise19, fig.cap = "Cell proportion data for simulations 91-95."}
+plot_sol_cell(91)
+```
+
+```{r cell-noise20, fig.cap = "Cell proportion data for simulations 96-100."}
+plot_sol_cell(96)
+```
+
+```{r fig.height = 2.5, fig.width = 8, fig.cap = "Cell proportion data for simulations 96-100."}
+plot_sol_cell(100)
+```
+```{r}
+```
+

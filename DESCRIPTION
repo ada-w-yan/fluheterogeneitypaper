@@ -1,0 +1,17 @@
+Package: fluheterogeneitypaper
+Title: Code for Modelling between-cell heterogeneity in within-host influenza virus infection
+Version: 0.0.0.9000
+Authors@R: person("Ada W. C.", "Yan", email = "ada.yan@rmit.edu.au", role = c("aut", "cre"))
+Description: Reproduces results in Modelling between-cell heterogeneity in within-host influenza virus infection
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Imports: 
+    ggplot2,
+    dplyr,
+    latex2exp,
+    odin,
+    dirmult,
+    cmdstanr
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.2.3

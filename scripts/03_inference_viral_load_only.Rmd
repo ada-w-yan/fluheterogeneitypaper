@@ -1,0 +1,420 @@
+---
+title: "Inference for a model with heterogeneity in beta using LHS, when we only have viral load data"
+author: "Ada Yan"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, echo = FALSE)
+```
+
+```{r include = FALSE}
+rm(list = ls())
+git_dir <- "../"
+devtools::load_all(git_dir)
+library(tidyverse)
+library(cmdstanr) # switch to cmdstanr for now as require Stan 2.34 for dirichlet_multinomial which is not available on rstan
+library(bayesplot)
+set.seed(1)
+sim_dir_name <- make_dir_Rmd("simulate_data.Rmd")
+dir_name <- make_dir_Rmd("03_infer_heterogeneous_beta_lhs.Rmd")
+```
+
+# Use simulated data from simulate_data.Rmd
+
+```{r}
+default_pars <- get_default_pars()
+samples <- readRDS(paste0(sim_dir_name, "samples_immune.rds"))
+sampling_pars <- get_sampling_pars()
+```
+
+```{r}
+varied_par_names <- c("log10_beta1", "log10_burst_size", "log10_V_0", "log10_delta", "log10_c1", "alpha")
+varied_par_names <- gsub("log10_", "", varied_par_names)
+fixed_par_names <- names(default_pars)[!(names(default_pars) %in% varied_par_names)]
+fixed_par_names <- fixed_par_names[!fixed_par_names == "p"]
+```
+
+# Fitting
+
+```{r}
+Delta_scaled <- c(-.8, 0, .8)
+
+simulate_data_partial <- function(idx, Delta_scaled, eval) {
+  sim_filename <- paste0(sim_dir_name, "sim_data_immune_", idx, "_",
+                         make_filename_from_number(Delta_scaled), ".rds")
+  if(!eval) return(sim_filename)
+  sol %>%
+    filter(idx == !!idx, Delta_scaled == !!Delta_scaled) %>%
+    simulate_data(sampling_times, sampling_pars, cells = TRUE, sim_filename)
+}
+
+fit_wrapper <- function(idx, Delta_scaled, inference_model, eval = TRUE) {
+  sim_filename <- simulate_data_partial(idx, Delta_scaled, eval = FALSE)
+  fit_filename <- gsub("sim_data", "refit", sim_filename)
+  fit_filename <- gsub(sim_dir_name, dir_name, fit_filename)
+  if(!eval) return(fit_filename)
+  
+  sim_data <- sim_filename %>% readRDS() %>% pluck("obs_V")
+  
+  # times at which data is observed, plus 0
+  solving_times <- unique(sim_data$t) %>% c(0) %>% unique() %>% sort()
+  # for stan solver exclude 0
+  solving_times_stan <- setdiff(solving_times, 0)
+  
+  match_idx <- function(obs_times, solving_times) {
+    match(obs_times, solving_times) - 1
+  }
+  
+  data_list <- samples %>%
+    filter(idx == !!idx) %>%
+    select(V_0, delta, c1, p, alpha) %>%
+    as.list() %>%
+    c(list(sigma_V = sampling_pars$sigma_V,
+           lod_V = sampling_pars$lod_V,
+           T_V = nrow(sim_data),
+           T_S = length(solving_times_stan),
+           ts = solving_times_stan,
+           t_V_idx = match_idx(sim_data$t, solving_times),
+           obs_V = sim_data$obs_V,
+           evaluate_likelihood = 1),
+      as.list(default_pars[fixed_par_names]))
+  
+  fit <- inference_model$sample(
+    data = data_list,
+    seed = 1,
+    chains = 8,
+    parallel_chains = 8
+  )
+  fit$save_object(file = fit_filename)
+  invisible(NULL)
+}
+
+par_grid <- expand_grid(idx = seq_len(nrow(samples)), Delta_scaled = Delta_scaled)
+filename_fn <- \(idx, Delta_scaled) fit_wrapper(idx, Delta_scaled, eval = FALSE)
+```
+
+```{r eval = FALSE}
+# "tiv_n_beta_fit_beta_no_cell_data_ordered" enforces ordering of beta but doens't help with the mixing
+inference_model <- cmdstan_model(get_model_filename("two_beta_innate_adaptive"))
+fit_partial <- \(idx, Delta_scaled) fit_wrapper(idx, Delta_scaled, inference_model, eval = TRUE)
+apply_named_args(par_grid, 1, fit_partial)
+```
+
+```{r eval = FALSE}
+get_summaries_subset_chains_partial <- \(idx, Delta_scaled) get_summaries_subset_chains(idx, Delta_scaled, fit_wrapper)
+summaries <- apply_named_args(par_grid, 1, get_summaries_subset_chains_partial) %>%
+  bind_rows()
+saveRDS(summaries, paste0(dir_name, "summaries_refit3.rds"))
+
+```
+
+```{r eval = FALSE}
+summaries <- readRDS(paste0(dir_name, "summaries_refit3.rds"))
+
+
+
+betas <- apply_named_args(par_grid, 1, \(idx, Delta_scaled) get_betas(idx = idx, Delta_scaled = Delta_scaled, filename_fn = filename_fn)) %>%
+  bind_rows() %>%
+  mutate(chain = as.numeric(chain))
+
+# exclude the same chains as above
+summaries_temp <- summaries %>%
+  select(idx, Delta_scaled, chosen_chain_combn) %>%
+  rename(chain = chosen_chain_combn)
+
+betas <- betas %>%
+  inner_join(summaries_temp)
+
+saveRDS(betas, paste0(dir_name, "beta.rds"))
+```
+```{r inferred-beta, fig.cap = "Percentage error in inferred value of $\\bar{\\beta}$ (mean and 95% CI) vs. true value of $\\Delta\'$ (top of facet, red line), by true value of $\\bar{\\beta}$ (x-axis).", fig.height = 2.5, fig.width = 6}
+betas <- readRDS(paste0(dir_name, "beta.rds"))
+weighted_mean_betas <- calc_weighted_mean_beta(betas, samples)
+
+quantiles_mean_betas <- weighted_mean_betas %>%
+  select(-iter, -chain) %>%
+  group_by(idx, Delta_scaled) %>%
+  summarise(lower = quantile(weighted_mean_beta, probs = .025, na.rm = TRUE),
+            median = quantile(weighted_mean_beta, probs = .5, na.rm = TRUE),
+            upper = quantile(weighted_mean_beta, probs = .975, na.rm = TRUE))
+
+errors <- quantiles_mean_betas %>%
+  select(idx, Delta_scaled, lower, median, upper) %>%
+  full_join(select(samples, idx, beta1)) %>%
+  rename(true_value = beta1) %>%
+  mutate(across(all_of(c("lower", "median", "upper")), ~ (.x - true_value) / true_value * 100)) %>%
+  drop_na()
+
+saveRDS(errors, paste0(dir_name, "errors.rds"))
+errors %>%
+  mutate(Delta_scaled = round(Delta_scaled, 1)) %>%
+  ggplot(aes(x = true_value)) +
+  facet_wrap(~Delta_scaled, nrow = 1) +
+  geom_point(aes(y = median)) +
+  geom_errorbar(aes(ymin = lower, ymax = upper)) +
+  theme_bw() +
+  coord_cartesian(ylim = c(-200, 200)) +
+  scale_x_log10("True value", guide = guide_axis(angle = 90)) +
+  ylab(latex2exp::TeX("% error in $\\beta$"))
+```
+
+```{r}
+dir_name_homogeneous <- make_dir_Rmd("04_fit_homogeneous_to_heterogeneous_beta_lhs.Rmd")
+errors_homogeneous <- readRDS(paste0(dir_name_homogeneous, "errors_refit3.rds")) %>%
+  mutate(range_homogeneous = upper - lower) %>%
+  select(idx, range_homogeneous)
+
+errors_with_without <- errors %>%
+  mutate(range = upper - lower) %>%
+  select(idx, Delta_scaled, range) %>%
+  inner_join(errors_homogeneous)
+
+g <- errors_with_without %>%
+  ggplot(aes(x = range_homogeneous, y = range)) +
+  geom_point() +
+  theme_bw() + 
+  theme(aspect.ratio=1, axis.text = element_text(size = 12)) +
+  coord_cartesian(xlim = c(0, 1000), ylim = c(0, 1000)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted") +
+  xlab(latex2exp::TeX("Width of 95% CI for $\\beta$ in homogeneous model")) +
+  ylab(latex2exp::TeX("Width of 95% CI for $\\bar{\\beta}$ in heterogeneous model"))
+
+g
+```
+# Inferred Delta
+
+```{r eval = FALSE}
+filename_fn <- \(idx, Delta_scaled)  fit_wrapper(idx, Delta_scaled, eval = FALSE)
+inferred_Delta_scaled <- apply_named_args(par_grid, 1, \(idx, Delta_scaled) get_pars(filename_fn = filename_fn,
+                                                                                     par_names = "Delta_scaled", idx = idx, Delta_scaled = Delta_scaled)) %>%
+  bind_rows() %>%
+  mutate(chain = as.numeric(chain))
+
+summaries <- readRDS(paste0(dir_name, "summaries_refit3.rds"))
+
+# exclude the same chains as above
+summaries_temp <- summaries %>%
+  select(idx, Delta_scaled, chosen_chain_combn) %>%
+  rename(chain = chosen_chain_combn)
+
+inferred_Delta_scaled <- inferred_Delta_scaled %>%
+  inner_join(summaries_temp)
+saveRDS(inferred_Delta_scaled, paste0(dir_name, "inferred_Delta_scaled.rds"))
+```
+
+
+
+```{r error-Delta-scaled, fig.cap = "Percentage error in $\\Delta$.", fig.width = 6, fig.height = 2.5}
+inferred_Delta_scaled <- readRDS(paste0(dir_name, "inferred_Delta_scaled.rds"))
+
+quantiles_Delta_scaled <- inferred_Delta_scaled %>%
+  select(-iter, -chain) %>%
+  group_by(idx, Delta_scaled) %>%
+  summarise(lower = quantile(value, probs = .025, na.rm = TRUE),
+            median = quantile(value, probs = .5, na.rm = TRUE),
+            upper = quantile(value, probs = .975, na.rm = TRUE))
+
+appender <- function(string) 
+  latex2exp::TeX(paste("$\\Delta = $", string))  
+
+quantiles_Delta_scaled %>%
+  # filter(!(idx %in% large_error), Delta_scaled %in% Delta_scaled_subset) %>%
+  full_join(select(samples, idx, beta1)) %>%
+  drop_na() %>%
+  ggplot() +
+  facet_wrap(~Delta_scaled, nrow = 1, labeller = as_labeller(appender, 
+                                                             default = label_parsed)) +
+  geom_point(aes(x = beta1, y = median)) +
+  geom_errorbar(aes(x = beta1, ymin = lower, ymax = upper)) +
+  geom_hline(aes(yintercept = Delta_scaled), color = "red") +
+  theme_bw() +
+  scale_x_log10(latex2exp::TeX("True value of \\beta"), guide = guide_axis(angle = 90)) +
+  ylab(latex2exp::TeX("Inferred value of $\\Delta$"))
+```
+
+CIs are wide throughout.
+
+# Model predictions to show why identifiability is needed
+
+Make model predictions varying $\alpha$ from the value for each simulation. First do this for the true values
+
+```{r}
+solving_time <- get_solving_time()
+
+two_beta_filename <- "innate_adaptive_two_beta.R"
+# compile ODEs
+gen <- compile_model(two_beta_filename)
+```
+
+```{r}
+solve_two_beta <- function(idx, Delta_scaled, alpha) { # calculate beta1 T_01 + beta2 T_02 = beta T_0
+  # the beta need to be calculated with the original alpha
+  sample_pars <- samples %>%
+    filter(idx == !!idx) %>%
+    select(-c(T_0, R_0, r, idx)) %>%
+    as.list()
+  if(Delta_scaled < 0) {
+    Delta <- Delta_scaled * (1 - sample_pars$alpha)
+  } else {
+    Delta <- Delta_scaled * sample_pars$alpha
+  }
+  beta1 <- sample_pars$beta1
+  sample_pars$beta1[1] <-  beta1 * (1 - Delta / sample_pars$alpha)
+  sample_pars$beta1[2] <-  beta1 * (1 + Delta / (1 - sample_pars$alpha))
+  stopifnot(all(sample_pars$beta1 > 0))
+  # then change to the new alpha
+  sample_pars$alpha <- alpha
+  sample_pars <- c(sample_pars, as.list(default_pars[fixed_par_names]))
+  simple_solve(gen = gen, pars = sample_pars, solving_time = solving_time) %>%
+    mutate(idx = !!idx,
+           Delta_scaled = !!Delta_scaled,
+           alpha = !!alpha)
+}
+
+alpha_vec <- seq(.2, .8, by = .2)
+
+sol <- lapply(alpha_vec, \(alpha) solve_two_beta(1, -0.8, alpha)) %>%
+  bind_rows()
+
+sol %>%
+  ggplot(aes(x = t, y = V, color = alpha, group = alpha)) +
+  geom_line() +
+  scale_y_log10()
+```
+
+Now make the model predictions (95\% CI) for the model fits:
+
+```{r}
+make_extended_obs_data_list <- function(data_list) {
+  data_list$ts <- seq(0, 7, by = .01) %>% setdiff(0)
+  data_list$T_S <- length(data_list$ts)
+  data_list
+}
+
+make_pred_new_alpha <- function(idx, Delta_scaled, alpha, eval) {
+  fit_filename <- filename_fn(idx, Delta_scaled)
+  fit <- readRDS(fit_filename)
+  pred_filename <- gsub("/fit", paste0("/pred_", make_filename_from_number(alpha)), fit_filename)
+  if(!eval) return(pred_filename)
+  
+  data_list <- samples %>%
+    filter(idx == !!idx) %>%
+    select(V_0, delta, c1, alpha, p) %>%
+    as.list()
+  
+  # get betas from the big tibble that has all the results
+  N_samples <- 100
+  betas <- betas %>%
+    filter(idx == !!idx, Delta_scaled == !!Delta_scaled) %>%
+    pivot_wider(names_from = par_name, values_from = value) %>%
+    select(starts_with("beta")) %>%
+    slice_sample(n = N_samples)
+  
+  data_list <- make_extended_obs_data_list(data_list)
+  data_list <- c(data_list, as.list(default_pars[fixed_par_names]))
+  data_list$beta1 <- as.matrix(betas)
+  data_list$N_samples <- N_samples
+  data_list$alpha <- alpha
+  
+  pred_model <- cmdstan_model(get_model_filename("two_beta_innate_adaptive_betas_pred"))
+  
+  pred <- pred_model$sample(
+    data = data_list,
+    seed = 1,
+    chains = 1,
+    fixed_param = TRUE,
+    iter_warmup = 1,
+    iter_sampling = 1
+  )
+  # browser()
+  pred$save_object(file = pred_filename)
+  invisible(NULL)
+}
+```
+
+```{r eval = FALSE}
+par_grid <- expand_grid(par_grid, alpha = alpha_vec)
+apply_named_args(par_grid, 1, \(idx, Delta_scaled, alpha) make_pred_new_alpha(idx, Delta_scaled, alpha, eval = TRUE))
+```
+
+```{r fig.width = 8, fig.height = 3}
+plot_preds_different_Delta_scaled_alpha <- function(idx, Delta_scaled_vec, alpha_vec, facets = FALSE) {
+  get_pred_different_Delta_scaled_alpha <- function(Delta_scaled, alpha) {
+    data_list <- make_extended_obs_data_list(list())
+    pred_times <- data_list$ts
+    # par_grid_subset <- par_grid %>%
+    #   filter(idx %in% remaining_large_error,
+    #          Delta_scaled %in% Delta_scaled_subset)
+    pred_filename <- make_pred_new_alpha(idx, Delta_scaled, alpha, eval = FALSE)
+    sol_V <- get_sol_V(pred_filename, pred_times, used_pred = TRUE)
+    quantiles <- sol_V %>%
+      group_by(t) %>%
+      summarise(lower = quantile(V, prob = 0.025),
+                median = quantile(V, prob = 0.5),
+                upper = quantile(V, prob = 0.975)) %>%
+      ungroup() %>%
+      mutate(Delta_scaled = !!Delta_scaled,
+             alpha = !!alpha)
+    quantiles
+  }
+  
+  par_grid <- expand_grid(Delta_scaled = Delta_scaled_vec,
+                          alpha = alpha_vec)
+  quantiles <- par_grid %>%
+    apply_named_args(1, get_pred_different_Delta_scaled_alpha) %>%
+    bind_rows() %>%
+    mutate(Delta_scaled = Delta_scaled, alpha = factor(alpha))
+  
+  sols <- par_grid %>%
+    apply_named_args(1, \(Delta_scaled, alpha) solve_two_beta(idx, Delta_scaled, alpha)) %>%
+    bind_rows() %>%
+    mutate(Delta_scaled = Delta_scaled,
+           alpha = factor(alpha))
+  
+  T_0_lab <- "Initial proportion of \n cell type 1"
+  
+  appender <- function(string) 
+    latex2exp::TeX(paste("$\\Delta = $", string))  
+  
+  original_alpha <- samples %>%
+    filter(idx == !!idx) %>%
+    pull(alpha) %>%
+    round(digits = 2)
+  
+  exclude_0 <- quantiles_Delta_scaled %>%
+    filter(idx == !!idx) %>%
+    mutate(exclude_0 = upper < 0 | lower > 0) %>%
+    pull(exclude_0)
+  
+  my_title <- paste(c(idx, original_alpha, exclude_0), collapse = " ")
+  
+  blank_tibble <- tibble(t = 0, V = 1e8)
+  g <- ggplot() +
+    
+    geom_ribbon(data = quantiles, aes(x = t, ymin = lower, ymax = upper, fill = alpha, group = alpha), alpha = .5) +
+    geom_blank(data = blank_tibble, aes(x = t, y = V)) +
+scale_y_log10(latex2exp::TeX("Viral load (TCID$_{50}$)"), breaks = 10^seq(0, 8, by = 2)) +
+    theme_bw() +
+    ylab(latex2exp::TeX("Viral load (TCID$_{50}$)")) +
+    xlab("Time (days)") +
+    labs(fill = latex2exp::TeX(T_0_lab))# +
+  # ggtitle(my_title)
+  
+  if(facets) {
+    g <- g + facet_grid(alpha~Delta_scaled)
+  } else {
+    g <- g + facet_wrap(~Delta_scaled, nrow = 1, labeller = as_labeller(appender, 
+                                                                        default = label_parsed))
+  }
+  g
+}
+
+plot_preds_different_Delta_scaled_alpha(1, Delta_scaled, alpha_vec)
+```
+
+```{r}
+sessionInfo()
+```
+This report is brought to you by `fluheterogeneousmodels` commit `r system("git -C /data/projects/punim0053/ayan/git_repos/fluheterogeneousmodels/ rev-parse --short HEAD", intern = TRUE)`.
