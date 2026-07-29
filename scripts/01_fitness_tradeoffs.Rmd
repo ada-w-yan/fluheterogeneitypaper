@@ -15,9 +15,19 @@ devtools::load_all("../")
 library(tidyverse)
 library(odin)
 library(deSolve)
+library(showtext)
+showtext_auto()
 ```
 
 ```{r}
+R_0_max_plotting <- 15
+AUC_max_plotting <- 3e5
+max_plotting_tibble <- tibble(name = c("R_0", "AUC"),
+                              x = c(0, 0),
+                              y = c(R_0_max_plotting, AUC_max_plotting)) %>%
+  mutate(name = factor(name, levels = c("R_0", "AUC")))
+
+
 model_filename <- "innate_adaptive_two_compartment.R"
 # compile ODEs
 gen <- compile_model(model_filename)
@@ -97,7 +107,7 @@ plot_AUC <- function(sols, AUC_name = "AUC") {
     filter(t == max(solving_time)) %>%
     ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = .data[[AUC_name]])) +
     geom_line() +
-    theme_bw(base_size = 16) +
+    theme_bw(base_size = 16, base_family= "Arial") +
     xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
     ylab(AUC_name)
   if(AUC_name == "AUC") {
@@ -114,7 +124,7 @@ plot_V <- function(sols) {
     geom_line() +
     scale_y_log10(latex2exp::TeX("Viral load (TCID$_{50}$)"), limits = c(1, 1e6), breaks = 10^seq(0, 8, by = 2)) +
     coord_cartesian(xlim = c(0, 10)) +
-    theme_bw(base_size = 16) +
+    theme_bw(base_size = 16, base_family= "Arial") +
     xlab("Time (days)") +
     labs(color = latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$"))
 }
@@ -124,7 +134,7 @@ plot_R_0 <- function(sols) {
     ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = R_0)) +
     geom_line() +
     coord_cartesian(xlim = c(-1, 1), ylim = c(0, 25)) +
-    theme_bw(base_size = 16) +
+    theme_bw(base_size = 16, base_family = "Arial") +
     xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
     ylab(latex2exp::TeX("$R_0$")) +
     labs(color = latex2exp::TeX("$T_{0,1}/T_0$"))
@@ -146,17 +156,42 @@ sols_TIV <- apply_named_args(beta1_alpha_grid, 1,
 ```
 
 ```{r fig.width = 6, fig.height = 3}
+plot_tropisms <- seq(-1, 1, by = .5)
+# (g <- plot_V(sols_TIV) +
 (g <- plot_V(filter(sols_TIV, beta1_minus_beta2_on_sum_beta %in% plot_tropisms)) +
-  scale_y_log10(latex2exp::TeX("Viral load (TCID$_{50}$)"), limits = c(1, 1e8), breaks = 10^seq(0, 8, by = 2)) +
-  coord_cartesian(xlim = c(0, 20)))
-# ggsave("viral_load_TIV.pdf", g, height = 3, width = 6)
+   scale_y_log10(latex2exp::TeX("Viral load (TCID$_{50}$)"), limits = c(1, 1e8), breaks = 10^seq(0, 8, by = 2)) +
+   coord_cartesian(xlim = c(0, 20)))
+ggsave("Fig6.pdf", g, height = 3, width = 6)
 ```
 
-```{r fig.width = 8, fig.height = 6}
+```{r fig.width = 8, fig.height = 3}
 # all on one plot
 
+# g <- bind_rows(mutate(sols_vary_T_0, model = "Immune"),
+#                mutate(sols_TIV, model = "TIV")) %>%
+#   filter(t == max(t)) %>%
+#   select(model, beta1_minus_beta2_on_sum_beta, AUC, AUC_log10, dose_response1) %>%
+#   rename(Model = model) %>%
+#   pivot_longer(cols = AUC:dose_response1, names_to = "Transmissibility metric", values_to = "Value") %>%
+#   mutate(`Transmissibility metric` = case_match(`Transmissibility metric`,
+#                                                 "AUC" ~ "AUC",
+#                                                 "AUC_log10" ~ "AUC log scale",
+#                                                 "dose_response1" ~"Dose response")) %>%
+#   # group_by(Model, `Transmissibility function`) %>%
+#   # mutate(value = value / max(value)) %>%
+#   ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = Value)) +
+#   ggh4x::facet_grid2(Model~`Transmissibility metric`, scales = "free", independent = "all") +
+#   # facet_grid(Model~ `Transmissibility metric`, scales = "free") +
+#   theme(strip.placement = "outside") + # Optional: adjust label placement
+#   geom_line() + 
+#   theme_bw(base_size = 16) +
+#   xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
+#   scale_x_continuous(sec.axis = sec_axis(~ . , name = "Transmissibility metric", breaks = NULL, labels = NULL)) +
+#   scale_y_continuous(sec.axis = sec_axis(~ . , name = "Model", breaks = NULL, labels = NULL)) +
+#   expand_limits(y = c(0))
+
 g <- bind_rows(mutate(sols_vary_T_0, model = "Immune"),
-          mutate(sols_TIV, model = "TIV")) %>%
+               mutate(sols_TIV, model = "TIV")) %>%
   filter(t == max(t)) %>%
   select(model, beta1_minus_beta2_on_sum_beta, AUC, AUC_log10, dose_response1) %>%
   rename(Model = model) %>%
@@ -168,16 +203,17 @@ g <- bind_rows(mutate(sols_vary_T_0, model = "Immune"),
   # group_by(Model, `Transmissibility function`) %>%
   # mutate(value = value / max(value)) %>%
   ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = Value)) +
-  ggh4x::facet_grid2(Model~`Transmissibility metric`, scales = "free", independent = "all") +
+  facet_wrap(~`Transmissibility metric`, scales = "free") +
+  # ggh4x::facet_grid2(Model~`Transmissibility metric`, scales = "free", independent = "all") +
   # facet_grid(Model~ `Transmissibility metric`, scales = "free") +
-  theme(strip.placement = "outside") + # Optional: adjust label placement
-  geom_line() + 
+  # theme(strip.placement = "outside") + # Optional: adjust label placement
+  geom_line(aes(color = Model, group = Model)) + 
   theme_bw(base_size = 16) +
   xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
   scale_x_continuous(sec.axis = sec_axis(~ . , name = "Transmissibility metric", breaks = NULL, labels = NULL)) +
-  scale_y_continuous(sec.axis = sec_axis(~ . , name = "Model", breaks = NULL, labels = NULL)) +
-  expand_limits(y = 0)
-# ggsave("transmissibility_metrics.pdf", g, width = 8, height = 6)
+  # scale_y_continuous(sec.axis = sec_axis(~ . , name = "Model", breaks = NULL, labels = NULL)) +
+  expand_limits(y = c(0))
+ggsave("Fig5_draft.pdf", g, width = 8, height = 3)
 g
 ```
 
@@ -235,30 +271,32 @@ sols <- apply_named_args(beta1_p1_alpha_grid, 1,
 
 ```{r fig.width = 5, fig.height = 3}
 
-sols %>%
+(g <- sols %>%
   filter(t == max(solving_time)) %>%
   ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = R_0, color = case_name, group = case_name)) +
   geom_line() +
-  coord_cartesian(xlim = c(-1, 1), ylim = c(0, 25)) +
+  coord_cartesian(xlim = c(-1, 1), ylim = c(0, R_0_max_plotting)) +
   theme_bw(base_size = 16) +
   xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
   ylab(latex2exp::TeX("$R_0$")) +
   labs(color = "") +
-  scale_color_discrete(labels = unname(latex2exp::TeX(c("$p_1 T_{01} < p_2 T_{02}$", "$p_1 T_{01} = p_2 T_{02}$", "$p_1 T_{01} > p_2 T_{02}$"))))
+  scale_color_discrete(labels = unname(latex2exp::TeX(c("$p_1 T_{01} < p_2 T_{02}$", "$p_1 T_{01} = p_2 T_{02}$", "$p_1 T_{01} > p_2 T_{02}$")))))
+ggsave("Fig4a.pdf", g, height = 3, width = 5)
 
 ```
 
 ```{r fig.width = 5, fig.height = 3}
-sols %>%
+(g <- sols %>%
   filter(t == max(solving_time)) %>%
   ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = AUC, color = case_name, group = case_name)) +
   geom_line() +
-  coord_cartesian(xlim = c(-1, 1)) +
+  coord_cartesian(xlim = c(-1, 1), ylim = c(0, AUC_max_plotting)) +
   theme_bw(base_size = 16) +
   xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
   ylab("AUC") +
   labs(color = "") +
-  scale_color_discrete(labels = unname(latex2exp::TeX(c("$p_1 T_{01} < p_2 T_{02}$", "$p_1 T_{01} = p_2 T_{02}$", "$p_1 T_{01} > p_2 T_{02}$"))))
+  scale_color_discrete(labels = unname(latex2exp::TeX(c("$p_1 T_{01} < p_2 T_{02}$", "$p_1 T_{01} = p_2 T_{02}$", "$p_1 T_{01} > p_2 T_{02}$")))))
+ggsave("Fig4c.pdf", g, height = 3, width = 5)
 
 ```
 
@@ -344,21 +382,24 @@ plot_AUC <- function(sols) {
 
 ```{r fig.width = 5, fig.height = 3}
 
-sols %>%
+(g <- sols %>%
   mutate(q1_minus_q2_on_q = factor(q1_minus_q2_on_q)) %>%
   filter(t == max(solving_time)) %>%
   ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = R_0, color = q1_minus_q2_on_q, group = q1_minus_q2_on_q)) +
   geom_line() +
-  coord_cartesian(xlim = c(-1, 1), ylim = c(0, 25)) +
+  coord_cartesian(xlim = c(-1, 1), ylim = c(0, R_0_max_plotting)) +
   theme_bw(base_size = 16) +
   xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
   ylab(latex2exp::TeX("$R_0$")) +
-  labs(color = latex2exp::TeX("$(q_1 - q_2)/\\bar{q}$")) #+
+  labs(color = latex2exp::TeX("$(q_1 - q_2)/\\bar{q}$"))) #+
 # scale_color_discrete(labels = unname(latex2exp::TeX(c("$q_1 < q_2$", "$q_1 = q_2$", "$q_1 > q_2$"))))
+ggsave("Fig4b.pdf", g, height = 3, width = 5)
 ```
 
 ```{r fig.width = 5, fig.height = 3}
-plot_AUC(sols)
+(g <- plot_AUC(sols) +
+  coord_cartesian(ylim = c(0, AUC_max_plotting)))
+ggsave("Fig4d.pdf", g, height = 3, width = 5)
 ```
 
 
@@ -369,32 +410,37 @@ all_sols <- bind_rows(mutate(sols_vary_T_0, scenario = "A: unequal cell abundanc
                       mutate(sols_vary_q, scenario = "C: unequal interferon production rates"))
 
 (g <- all_sols %>%
-  filter(beta1_minus_beta2_on_sum_beta %in% plot_tropisms) %>%
-  ggplot(aes(x = t, y = V, color = beta1_minus_beta2_on_sum_beta, group = beta1_minus_beta2_on_sum_beta)) +
-  facet_wrap(~scenario, labeller = label_wrap_gen(width = 25)) +
-  geom_line() +
-  scale_y_log10(latex2exp::TeX("Viral load (TCID$_{50}$)"), limits = c(1, 1e6), breaks = 10^seq(0, 8, by = 2)) +
-  coord_cartesian(xlim = c(0, 10)) +
-  theme_bw(base_size = 16) +
-  xlab("Time (days)") +
-  labs(color = latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")))
-# ggsave("all_viral_loads.pdf", g, width = 10, height = 3)
+    filter(beta1_minus_beta2_on_sum_beta %in% plot_tropisms) %>%
+    ggplot(aes(x = t, y = V, color = beta1_minus_beta2_on_sum_beta, group = beta1_minus_beta2_on_sum_beta)) +
+    facet_wrap(~scenario, labeller = label_wrap_gen(width = 25)) +
+    geom_line() +
+    scale_y_log10(latex2exp::TeX("Viral load (TCID$_{50}$)"), limits = c(1, 1e6), breaks = 10^seq(0, 8, by = 2)) +
+    coord_cartesian(xlim = c(0, 10)) +
+    theme_bw(base_size = 16) +
+    xlab("Time (days)") +
+    labs(color = latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")))
+ggsave("Fig2.pdf", g, width = 10, height = 3)
+
+(g <- g + scale_y_continuous(latex2exp::TeX("Viral load (TCID$_{50}$)")))
+ggsave("Fig2_supp.pdf", g, width = 10, height = 3)
 ```
 ```{r fig.width = 8, fig.height = 6}
+
 (g <- all_sols %>%
-  filter(t == max(t)) %>%
-  select(scenario, beta1_minus_beta2_on_sum_beta, R_0, AUC) %>%
-  pivot_longer(cols = c(R_0, AUC)) %>%
-  mutate(name = factor(name, levels = c("R_0", "AUC"))) %>%
-  ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = value)) +
-  facet_grid(name~scenario, scales = "free", labeller = label_wrap_gen(width = 25), switch = "y") +
-  geom_line() +
-  theme_bw(base_size = 16) +
-  xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
-  expand_limits(y = 0) +
-  theme(strip.placement = "outside") +
-  ylab(""))
-# ggsave("all_R_0_auc.pdf", g, width = 8, height = 6)
+    filter(t == max(t)) %>%
+    select(scenario, beta1_minus_beta2_on_sum_beta, R_0, AUC) %>%
+    pivot_longer(cols = c(R_0, AUC)) %>%
+    mutate(name = factor(name, levels = c("R_0", "AUC"))) %>%
+    ggplot(aes(x = beta1_minus_beta2_on_sum_beta, y = value)) +
+    facet_grid(name~scenario, scales = "free", labeller = label_wrap_gen(width = 25), switch = "y") +
+    geom_line() +
+    geom_blank(data = max_plotting_tibble, aes(x = x, y = y)) +
+    theme_bw(base_size = 16) +
+    xlab(latex2exp::TeX("$(\\beta_1- \\beta_2)/(\\beta_1 + \\beta_2)$")) +
+    expand_limits(y = 0) +
+    theme(strip.placement = "outside") +
+    ylab(""))
+ggsave("Fig3.pdf", g, width = 8, height = 6)
 ```
 
 ```{r}
